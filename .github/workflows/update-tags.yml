@@ -1,0 +1,25 @@
+name: Update floating tags
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Keep v1 floating tag current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Move v1 tag to latest master
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa v1 -m "v1 (floating — latest stable)"
+          git push origin v1 --force
