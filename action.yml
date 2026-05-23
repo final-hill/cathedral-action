@@ -1,0 +1,121 @@
+name: Cathedral PR Analysis
+description: >
+  Analyze a pull request with Cathedral to derive candidate requirements,
+  post a PR comment with findings, and optionally fail the commit status
+  when error-severity diagnostics are present (Production enforcement).
+
+branding:
+  icon: check-square
+  color: blue
+
+inputs:
+  endpoint:
+    description: Cathedral instance URL (e.g. https://cathedral.example.com)
+    required: true
+  token:
+    description: Cathedral PAT — store as a GitHub Secret
+    required: true
+  solution:
+    description: Cathedral solution slug to analyze against
+    required: true
+  github-token:
+    description: GitHub token used to fetch the PR diff and post comments
+    required: true
+    default: ${{ github.token }}
+  enforcement-level:
+    description: >
+      Override enforcement level for this run.
+      'Production' sets a blocking commit status on error-severity diagnostics.
+      'Developing' and 'Exploratory' post a comment only (non-blocking).
+    required: false
+    default: Developing
+
+outputs:
+  finding-count:
+    description: Number of candidate requirements found
+    value: ${{ steps.analyze.outputs.finding-count }}
+  error-count:
+    description: Number of error-severity diagnostics
+    value: ${{ steps.analyze.outputs.error-count }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Analyze PR with Cathedral
+      id: analyze
+      shell: bash
+      env:
+        CATHEDRAL_ENDPOINT: ${{ inputs.endpoint }}
+        CATHEDRAL_TOKEN: ${{ inputs.token }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set +e
+        OUTPUT=$(npx --yes @cathedral/cli@latest analyze-pr \
+          --repo "${{ github.repository }}" \
+          --pr "${{ github.event.pull_request.number }}" \
+          --solution "${{ inputs.solution }}" \
+          --post-comment \
+          --format json)
+        EXIT_CODE=$?
+        set -e
+
+        echo "exit-code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+        FINDING_COUNT=$(echo "$OUTPUT" | node -e "
+          const chunks = []; process.stdin.on('data', c => chunks.push(c));
+          process.stdin.on('end', () => {
+            try {
+              const d = JSON.parse(chunks.join(''));
+              console.log((d.findings || []).length);
+            } catch { console.log(0); }
+          });
+        " 2>/dev/null || echo 0)
+
+        ERROR_COUNT=$(echo "$OUTPUT" | node -e "
+          const chunks = []; process.stdin.on('data', c => chunks.push(c));
+          process.stdin.on('end', () => {
+            try {
+              const d = JSON.parse(chunks.join(''));
+              console.log((d.diagnostics || []).filter(d => d.severity === 'error').length);
+            } catch { console.log(0); }
+          });
+        " 2>/dev/null || echo 0)
+
+        echo "finding-count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+        echo "error-count=$ERROR_COUNT" >> "$GITHUB_OUTPUT"
+
+        if [ $EXIT_CODE -eq 2 ]; then
+          echo "::error::Cathedral authentication or connectivity failure. Check CATHEDRAL_TOKEN and endpoint."
+          exit 2
+        fi
+
+    - name: Set commit status (Production enforcement)
+      if: inputs.enforcement-level == 'Production'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        ERROR_COUNT="${{ steps.analyze.outputs.error-count }}"
+        SHA="${{ github.event.pull_request.head.sha }}"
+        REPO="${{ github.repository }}"
+
+        if [ "${ERROR_COUNT:-0}" -gt 0 ]; then
+          STATE="failure"
+          DESCRIPTION="${ERROR_COUNT} error-severity diagnostic(s) must be resolved before merge"
+        else
+          STATE="success"
+          DESCRIPTION="No blocking diagnostics found"
+        fi
+
+        gh api \
+          --method POST \
+          "/repos/${REPO}/statuses/${SHA}" \
+          -f state="${STATE}" \
+          -f description="${DESCRIPTION}" \
+          -f context="cathedral/requirements" \
+          -f target_url="${{ github.event.pull_request.html_url }}"
